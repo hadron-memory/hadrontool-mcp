@@ -35,17 +35,80 @@ function isPrivateV4(addr: string): boolean {
   );
 }
 
-/** True for IPv6 addresses that are loopback/link-local/unique-local/v4-mapped-private. */
-function isPrivateV6(addr: string): boolean {
-  const lower = addr.toLowerCase();
-  if (lower === '::' || lower === '::1') return true;
-  if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) {
-    return true; // fe80::/10 link-local
+/**
+ * Decode an IPv6 literal to its 16 octets, or null when unparseable.
+ *
+ * String matching on IPv6 text is a trap: `new URL()` canonicalizes
+ * `::ffff:127.0.0.1` to the hex form `::ffff:7f00:1`, so any regex keyed on
+ * the dotted-quad shape silently misses it (CVE-class SSRF bypass). We work
+ * on the decoded bytes instead — the one representation an attacker cannot
+ * reshape. Handles `::` compression, embedded dotted-quad in the low 32
+ * bits, and zone ids.
+ */
+function ipv6ToBytes(addr: string): number[] | null {
+  let s = addr.toLowerCase();
+  const zone = s.indexOf('%');
+  if (zone !== -1) s = s.slice(0, zone); // drop the scope id (fe80::1%eth0)
+
+  const halves = s.split('::');
+  if (halves.length > 2) return null; // at most one '::'
+
+  const parseGroups = (part: string): number[] | null => {
+    if (part === '') return [];
+    const tokens = part.split(':');
+    const bytes: number[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+      const tok = tokens[i];
+      if (tok.includes('.')) {
+        // Embedded IPv4 — only legal as the final group (low 32 bits).
+        if (i !== tokens.length - 1) return null;
+        const octets = tok.split('.');
+        if (octets.length !== 4) return null;
+        for (const o of octets) {
+          if (!/^\d{1,3}$/.test(o)) return null;
+          const n = Number(o);
+          if (n > 255) return null;
+          bytes.push(n);
+        }
+      } else {
+        if (!/^[0-9a-f]{1,4}$/.test(tok)) return null;
+        const n = parseInt(tok, 16);
+        bytes.push((n >> 8) & 0xff, n & 0xff);
+      }
+    }
+    return bytes;
+  };
+
+  const head = parseGroups(halves[0]);
+  if (head === null) return null;
+  if (halves.length === 2) {
+    const tail = parseGroups(halves[1]);
+    if (tail === null) return null;
+    const missing = 16 - head.length - tail.length;
+    if (missing < 0) return null; // '::' must stand for at least one zero group
+    return [...head, ...new Array(missing).fill(0), ...tail];
   }
-  if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // fc00::/7 unique-local
-  // IPv4-mapped (::ffff:a.b.c.d) — apply the v4 rules to the embedded address.
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(lower);
-  if (mapped) return isPrivateV4(mapped[1]);
+  return head.length === 16 ? head : null; // no '::' → must be fully specified
+}
+
+/** True for IPv6 addresses that are loopback/link-local/unique-local, or that embed a private IPv4. */
+function isPrivateV6(addr: string): boolean {
+  const b = ipv6ToBytes(addr);
+  if (b === null || b.length !== 16) return true; // unparseable → refuse
+  const zeros = (from: number, to: number): boolean => b.slice(from, to).every((x) => x === 0);
+  const embeddedV4 = (): boolean => isPrivateV4(b.slice(12, 16).join('.'));
+
+  // fe80::/10 link-local
+  if (b[0] === 0xfe && (b[1] & 0xc0) === 0x80) return true;
+  // fc00::/7 unique-local
+  if ((b[0] & 0xfe) === 0xfc) return true;
+  // ::ffff:0:0/96 IPv4-mapped → judge the embedded IPv4
+  if (zeros(0, 10) && b[10] === 0xff && b[11] === 0xff) return embeddedV4();
+  // ::/96 — unspecified (::), loopback (::1), and deprecated IPv4-compatible
+  if (zeros(0, 12)) return embeddedV4();
+  // 64:ff9b::/96 NAT64 well-known prefix → judge the embedded IPv4
+  if (b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b && zeros(4, 12)) return embeddedV4();
+
   return false;
 }
 

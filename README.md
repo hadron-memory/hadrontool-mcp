@@ -63,8 +63,13 @@ protocol, and policy failures use the typed error codes:
   Docker network with internal services). Known limitation: the check is
   resolve-then-connect and does not yet pin the resolved address, so a
   DNS-rebinding upstream could race it; address pinning is a follow-up.
-- **Bounded responses.** Content blocks are capped (100 blocks, 200k chars
-  per text block) so an upstream cannot flood a run hop's context.
+- **Bounded responses.** Tool results are capped so an upstream cannot flood
+  a run hop's context: 100 content blocks, every string field truncated at
+  200k chars (text, base64 `data`, `resource` blobs, `_meta` — not just text
+  blocks), and a 5 MB total-serialized ceiling that drops trailing blocks.
+  `tools/list` draining is likewise bounded (1000 tools / 50 pages, and a
+  repeated pagination cursor fails typed) so a hostile upstream can't loop it
+  forever.
 
 ## Environment
 
