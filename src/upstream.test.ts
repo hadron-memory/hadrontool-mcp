@@ -81,6 +81,15 @@ describe('boundContent — responses are bounded (all content, not just text)', 
     expect(boundContent(many)).toHaveLength(100);
   });
 
+  it('enforces the total cap even on the first block (no bypass)', () => {
+    // A single hostile block whose many 200k-capped fields aggregate past 5 MB.
+    const fields: Record<string, unknown> = { type: 'resource' };
+    for (let i = 0; i < 40; i++) fields[`f${i}`] = 'z'.repeat(200_000);
+    const bounded = boundContent([fields]);
+    expect(bounded).toHaveLength(1);
+    expect(bounded[0].text).toContain('hadrontool-mcp dropped 1 content block');
+  });
+
   it('caps the total serialized size and appends a drop marker', () => {
     // 40 blocks × ~200k each ≈ 8MB > 5MB cap → trailing blocks dropped.
     const blocks = Array.from({ length: 40 }, () => ({ type: 'text', text: 'y'.repeat(200_000) }));

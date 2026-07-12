@@ -103,7 +103,7 @@ export async function drainPages<T>(
       seenCursors.add(cursor);
     }
   } while (cursor !== undefined && items.length < opts.maxItems && pages < opts.maxPages);
-  return items;
+  return items.slice(0, opts.maxItems); // a fat final page must not push us over the cap
 }
 
 /** `tools/list` against the target (paginated upstreams are drained, bounded). */
@@ -161,8 +161,8 @@ export function boundContent(rawBlocks: Array<Record<string, unknown>>): Array<R
   const bounded: Array<Record<string, unknown>> = [];
   let total = 0;
   for (const block of capped) {
-    const size = JSON.stringify(block).length;
-    if (bounded.length > 0 && total + size > MAX_TOTAL_BYTES) break;
+    const size = Buffer.byteLength(JSON.stringify(block), 'utf8'); // true serialized bytes, not UTF-16 units
+    if (total + size > MAX_TOTAL_BYTES) break; // enforced from the first block — no bypass
     bounded.push(block);
     total += size;
   }
