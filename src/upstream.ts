@@ -71,30 +71,110 @@ async function withUpstream<T>(target: UpstreamTarget, fn: (client: Client) => P
   }
 }
 
-/** `tools/list` against the target (paginated upstreams are drained). */
-export async function listUpstreamTools(target: UpstreamTarget): Promise<UpstreamToolDefinition[]> {
-  return withUpstream(target, async (client) => {
-    const tools: UpstreamToolDefinition[] = [];
-    let cursor: string | undefined;
-    do {
-      const page = await client.listTools(cursor ? { cursor } : undefined, { timeout: config.listTimeoutMs });
-      for (const t of page.tools) {
-        tools.push({
-          name: t.name,
-          ...(t.description ? { description: t.description } : {}),
-          inputSchema: (t.inputSchema as Record<string, unknown>) ?? { type: 'object' },
-        });
+/** Accumulated-tool cap: stop draining once this many tools are collected. */
+const MAX_TOOLS = 1000;
+/** Page-count cap: a malicious upstream must not keep us draining forever. */
+const MAX_LIST_PAGES = 50;
+
+/**
+ * Drain a cursor-paginated MCP list until it ends, guarding against an
+ * upstream that never terminates. Two backstops beyond the item cap: a
+ * repeated cursor (`{ items: [], nextCursor: "same" }` forever) fails typed,
+ * and an unbounded run of fresh empty pages hits the page cap. Each page
+ * still has its own per-request timeout; this bounds the loop *around* them.
+ */
+export async function drainPages<T>(
+  fetchPage: (cursor: string | undefined) => Promise<{ items: T[]; nextCursor?: string }>,
+  opts: { maxItems: number; maxPages: number },
+): Promise<T[]> {
+  const items: T[] = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
+  let pages = 0;
+  do {
+    const page = await fetchPage(cursor);
+    items.push(...page.items);
+    pages += 1;
+    cursor = page.nextCursor;
+    if (cursor !== undefined) {
+      if (seenCursors.has(cursor)) {
+        throw new UpstreamProtocolError('tools/list returned a repeated pagination cursor');
       }
-      cursor = page.nextCursor;
-    } while (cursor && tools.length < 1000); // hard page cap — never loop forever
-    return tools;
-  });
+      seenCursors.add(cursor);
+    }
+  } while (cursor !== undefined && items.length < opts.maxItems && pages < opts.maxPages);
+  return items;
 }
 
-/** Per-block text cap — an upstream must not flood a run hop's context. */
+/** `tools/list` against the target (paginated upstreams are drained, bounded). */
+export async function listUpstreamTools(target: UpstreamTarget): Promise<UpstreamToolDefinition[]> {
+  return withUpstream(target, (client) =>
+    drainPages<UpstreamToolDefinition>(
+      async (cursor) => {
+        const page = await client.listTools(cursor ? { cursor } : undefined, { timeout: config.listTimeoutMs });
+        return {
+          items: page.tools.map((t) => ({
+            name: t.name,
+            ...(t.description ? { description: t.description } : {}),
+            inputSchema: (t.inputSchema as Record<string, unknown>) ?? { type: 'object' },
+          })),
+          nextCursor: page.nextCursor,
+        };
+      },
+      { maxItems: MAX_TOOLS, maxPages: MAX_LIST_PAGES },
+    ),
+  );
+}
+
+/** Per-string cap — bounds any string field (text, base64 `data`, `_meta`), not just text blocks. */
 const MAX_TEXT_LENGTH = 200_000;
-/** Content-block count cap, same rationale. */
+/** Content-block count cap. */
 const MAX_BLOCKS = 100;
+/** Total serialized-response cap — the real backstop against unbounded aggregate payloads. */
+const MAX_TOTAL_BYTES = 5_000_000;
+
+/**
+ * Recursively cap every string in a content block. A per-*text*-block cap
+ * misses image/audio base64 `data`, `resource` `blob`/`text`, and `_meta`
+ * — all of which an upstream can inflate. We walk the whole block instead.
+ */
+function boundStrings(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.length > MAX_TEXT_LENGTH ? `${value.slice(0, MAX_TEXT_LENGTH)}\n[truncated by hadrontool-mcp]` : value;
+  }
+  if (Array.isArray(value)) return value.map(boundStrings);
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = boundStrings(v);
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Enforce the "bounded responses" contract: cap block count, cap every
+ * string, then cap the total serialized size (dropping trailing blocks with
+ * a marker). This is what core relies on to keep a run hop's context sane.
+ */
+export function boundContent(rawBlocks: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const capped = rawBlocks.slice(0, MAX_BLOCKS).map((b) => boundStrings(b) as Record<string, unknown>);
+  const bounded: Array<Record<string, unknown>> = [];
+  let total = 0;
+  for (const block of capped) {
+    const size = JSON.stringify(block).length;
+    if (bounded.length > 0 && total + size > MAX_TOTAL_BYTES) break;
+    bounded.push(block);
+    total += size;
+  }
+  const dropped = capped.length - bounded.length;
+  if (dropped > 0) {
+    bounded.push({
+      type: 'text',
+      text: `[hadrontool-mcp dropped ${dropped} content block(s): response exceeded ${MAX_TOTAL_BYTES} bytes]`,
+    });
+  }
+  return bounded;
+}
 
 /** `tools/call` against the target. isError stays a RESULT, never an HTTP error. */
 export async function callUpstreamTool(
@@ -107,12 +187,6 @@ export async function callUpstreamTool(
       timeout: config.callTimeoutMs,
     });
     const blocks = Array.isArray(result.content) ? (result.content as Array<Record<string, unknown>>) : [];
-    const bounded = blocks.slice(0, MAX_BLOCKS).map((block) => {
-      if (block.type === 'text' && typeof block.text === 'string' && block.text.length > MAX_TEXT_LENGTH) {
-        return { ...block, text: `${block.text.slice(0, MAX_TEXT_LENGTH)}\n[truncated by hadrontool-mcp]` };
-      }
-      return block;
-    });
-    return { isError: result.isError === true, content: bounded };
+    return { isError: result.isError === true, content: boundContent(blocks) };
   });
 }
