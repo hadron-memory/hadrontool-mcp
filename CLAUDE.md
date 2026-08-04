@@ -55,8 +55,8 @@ No database. No prisma. Tests need no setup at all.
 ## Use of Hadron
 
 This tool has no memory of its own — work against the shared ones:
-`hrn:memory:hadronmemory.com::dev` (findings/conventions/ops + the
-`preflight` routing index), `hrn:memory:hadronmemory.com::hadron-server`
-(core integration), `hrn:memory:hadronmemory.com::specs` (platform specs).
-Read `hadronmemory.com::dev::instructions` once per session; capture
+`hrn:mem:hadronmemory.com:dev` (findings/conventions/ops + the
+`preflight` routing index), `hrn:mem:hadronmemory.com:hadron-server`
+(core integration), `hrn:mem:hadronmemory.com:specs` (platform specs).
+Read `hrn:node:hadronmemory.com:dev:instructions` once per session; capture
 non-obvious findings immediately.
